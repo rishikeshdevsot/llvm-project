@@ -308,12 +308,12 @@ static void findLiveSetAtInst(Instruction *inst, GCPtrLivenessData &Data,
 // TODO: Once we can get to the GCStrategy, this becomes
 // Optional<bool> isGCManagedPointer(const Type *Ty) const override {
 
-static bool isGCPointerType(Type *T) {
+static bool isGCPointerType(Type *T, bool Compressed) {
   if (auto *PT = dyn_cast<PointerType>(T))
     // For the sake of this example GC, we arbitrarily pick addrspace(1) as our
     // GC managed heap.  We know that a pointer into this heap needs to be
     // updated and that no other pointer does.
-    return PT->getAddressSpace() == 1;
+    return PT->getAddressSpace() == 1 || (Compressed && PT->getAddressSpace() == 2);
   return false;
 }
 
@@ -321,38 +321,66 @@ static bool isGCPointerType(Type *T) {
 // pointer and b) is of a type this code expects to encounter as a live value.
 // (The insertion code will assert that a type which matches (a) and not (b)
 // is not encountered.)
-static bool isHandledGCPointerType(Type *T) {
+static bool isHandledGCPointerType(Type *T, bool Compressed) {
   // We fully support gc pointers
-  if (isGCPointerType(T))
+  if (isGCPointerType(T, Compressed))
     return true;
   // We partially support vectors of gc pointers. The code will assert if it
   // can't handle something.
   if (auto VT = dyn_cast<VectorType>(T))
-    if (isGCPointerType(VT->getElementType()))
+    if (isGCPointerType(VT->getElementType(), Compressed))
       return true;
   return false;
 }
 
+static bool supportsCompressedPointers(Function& F) {
+  // TODO: This should check the GCStrategy
+  if (F.hasGC()) {
+    const auto &FunctionGCName = F.getGC();
+    const StringRef CompressedName("compressed-pointer");
+    return (CompressedName == FunctionGCName);
+  } else
+    return false;
+}
+
+static bool supportsCompressedPointers(BasicBlock& BB) {
+  return supportsCompressedPointers(*BB.getParent());
+}
+
+static bool supportsCompressedPointers(Instruction& Inst) {
+  return supportsCompressedPointers(*Inst.getParent());
+}
+
 #ifndef NDEBUG
+static bool containsGCPtrType(Type *Ty, bool Compressed);
+
+static bool containsGCPtrTypeCompressed(Type *Ty) {
+  return containsGCPtrType(Ty, true);
+}
+
+static bool containsGCPtrTypeNotCompressed(Type *Ty) {
+  return containsGCPtrType(Ty, false);
+}
+
 /// Returns true if this type contains a gc pointer whether we know how to
 /// handle that type or not.
-static bool containsGCPtrType(Type *Ty) {
-  if (isGCPointerType(Ty))
+static bool containsGCPtrType(Type *Ty, bool Compressed) {
+  if (isGCPointerType(Ty, Compressed))
     return true;
   if (VectorType *VT = dyn_cast<VectorType>(Ty))
-    return isGCPointerType(VT->getScalarType());
+    return isGCPointerType(VT->getScalarType(), Compressed);
   if (ArrayType *AT = dyn_cast<ArrayType>(Ty))
-    return containsGCPtrType(AT->getElementType());
+    return containsGCPtrType(AT->getElementType(), Compressed);
   if (StructType *ST = dyn_cast<StructType>(Ty))
-    return llvm::any_of(ST->elements(), containsGCPtrType);
+    return llvm::any_of(ST->elements(), Compressed ? containsGCPtrTypeCompressed : containsGCPtrTypeNotCompressed);
   return false;
 }
 
 // Returns true if this is a type which a) is a gc pointer or contains a GC
 // pointer and b) is of a type which the code doesn't expect (i.e. first class
 // aggregates).  Used to trip assertions.
-static bool isUnhandledGCPointerType(Type *Ty) {
-  return containsGCPtrType(Ty) && !isHandledGCPointerType(Ty);
+static bool isUnhandledGCPointerType(Type *Ty, bool Compressed) {
+  return containsGCPtrType(Ty, Compressed) && !isHandledGCPointerType(Ty, Compressed);
 }
 #endif
 
@@ -1400,7 +1428,7 @@ static void CreateGCRelocates(ArrayRef<Value *> LiveVariables,
   // to an i8* of the right address space.  A bitcast is added later to convert
   // gc_relocate to the actual value's type.
   auto getGCRelocateDecl = [&] (Type *Ty) {
-    assert(isHandledGCPointerType(Ty));
+    assert(isHandledGCPointerType(Ty, supportsCompressedPointers(*StatepointToken)));
     auto AS = Ty->getScalarType()->getPointerAddressSpace();
     Type *NewTy = Type::getInt8PtrTy(M->getContext(), AS);
     if (auto *VT = dyn_cast<VectorType>(Ty))
@@ -1517,6 +1545,15 @@ static StringRef getDeoptLowering(CallBase *Call) {
     return F->getFnAttribute(DeoptLowering).getValueAsString();
   }
   return "live-through";
+}
+
+static void getCompressedGCArgs(std::vector<Value *> &CompressedArgsVector,
+                                ArrayRef<Value *> GCArgs) {
+  for (Value *LiveVal : GCArgs) {
+    if (auto *PT = dyn_cast<PointerType>(LiveVal->getType()))
+      if (PT->getAddressSpace() == 2)
+        CompressedArgsVector.push_back(LiveVal);
+  }
 }
 
 static void
@@ -1694,9 +1731,22 @@ makeStatepointExplicitImpl(CallBase *Call, /* to replace */
   // Create the statepoint given all the arguments
   GCStatepointInst *Token = nullptr;
   if (auto *CI = dyn_cast<CallInst>(Call)) {
-    CallInst *SPCall = Builder.CreateGCStatepointCall(
-        StatepointID, NumPatchBytes, CallTarget, Flags, CallArgs,
-        TransitionArgs, DeoptArgs, GCArgs, "safepoint_token");
+    CallInst *SPCall;
+    if (supportsCompressedPointers(*Call)) {
+      assert(DeoptArgs->empty() &&
+             "Deopt args are not supported when using compressed pointers");
+      std::vector<Value *> CompressedArgsVector;
+      getCompressedGCArgs(CompressedArgsVector, GCArgs);
+      ArrayRef<Value *> CompressedArgs(CompressedArgsVector);
+
+      SPCall = Builder.CreateGCStatepointCall(
+          StatepointID, NumPatchBytes, CallTarget, Flags, CallArgs,
+          TransitionArgs, CompressedArgs, GCArgs, "safepoint_token");
+    } else {
+      SPCall = Builder.CreateGCStatepointCall(
+          StatepointID, NumPatchBytes, CallTarget, Flags, CallArgs,
+          TransitionArgs, DeoptArgs, GCArgs, "safepoint_token");
+    }
 
     SPCall->setTailCallKind(CI->getTailCallKind());
     SPCall->setCallingConv(CI->getCallingConv());
@@ -1721,10 +1771,24 @@ makeStatepointExplicitImpl(CallBase *Call, /* to replace */
     // Insert the new invoke into the old block.  We'll remove the old one in a
     // moment at which point this will become the new terminator for the
     // original block.
-    InvokeInst *SPInvoke = Builder.CreateGCStatepointInvoke(
-        StatepointID, NumPatchBytes, CallTarget, II->getNormalDest(),
-        II->getUnwindDest(), Flags, CallArgs, TransitionArgs, DeoptArgs, GCArgs,
-        "statepoint_token");
+    InvokeInst *SPInvoke;
+    if (supportsCompressedPointers(*Call)) {
+      assert(DeoptArgs->empty() &&
+             "Deopt args are not supported when using compressed pointers");
+      std::vector<Value *> CompressedArgsVector;
+      getCompressedGCArgs(CompressedArgsVector, GCArgs);
+      ArrayRef<Value *> CompressedArgs(CompressedArgsVector);
+
+      SPInvoke = Builder.CreateGCStatepointInvoke(
+          StatepointID, NumPatchBytes, CallTarget, II->getNormalDest(),
+          II->getUnwindDest(), Flags, CallArgs, TransitionArgs, CompressedArgs,
+          GCArgs, "statepoint_token");
+    } else {
+      SPInvoke = Builder.CreateGCStatepointInvoke(
+          StatepointID, NumPatchBytes, CallTarget, II->getNormalDest(),
+          II->getUnwindDest(), Flags, CallArgs, TransitionArgs, DeoptArgs,
+          GCArgs, "statepoint_token");
+    }
 
     SPInvoke->setCallingConv(II->getCallingConv());
 
@@ -2432,6 +2496,7 @@ static bool insertParsePoints(Function &F, DominatorTree &DT,
                               TargetTransformInfo &TTI,
                               SmallVectorImpl<CallBase *> &ToUpdate,
                               DefiningValueMapTy &DVCache) {
+  bool hasCompressedPointers = supportsCompressedPointers(F);
 #ifndef NDEBUG
   // Validate the input
   std::set<CallBase *> Uniqued;
@@ -2466,9 +2531,9 @@ static bool insertParsePoints(Function &F, DominatorTree &DT,
     SmallVector<Value *, 64> DeoptValues;
 
     for (Value *Arg : GetDeoptBundleOperands(Call)) {
-      assert(!isUnhandledGCPointerType(Arg->getType()) &&
+      assert(!isUnhandledGCPointerType(Arg->getType(), hasCompressedPointers) &&
              "support for FCA unimplemented");
-      if (isHandledGCPointerType(Arg->getType()))
+      if (isHandledGCPointerType(Arg->getType(), hasCompressedPointers))
         DeoptValues.push_back(Arg);
     }
 
@@ -2639,7 +2704,7 @@ static bool insertParsePoints(Function &F, DominatorTree &DT,
 #ifndef NDEBUG
   // Validation check
   for (auto *Ptr : Live)
-    assert(isHandledGCPointerType(Ptr->getType()) &&
+    assert(isHandledGCPointerType(Ptr->getType(), hasCompressedPointers) &&
            "must be a gc pointer type");
 #endif
 
@@ -2774,8 +2839,10 @@ static bool shouldRewriteStatepointsIn(Function &F) {
     const auto &FunctionGCName = F.getGC();
     const StringRef StatepointExampleName("statepoint-example");
     const StringRef CoreCLRName("coreclr");
+    const StringRef CompressedName("compressed-pointer");
     return (StatepointExampleName == FunctionGCName) ||
-           (CoreCLRName == FunctionGCName);
+           (CoreCLRName == FunctionGCName) ||
+           (CompressedName == FunctionGCName);
   } else
     return false;
 }
@@ -2951,7 +3018,8 @@ bool RewriteStatepointsForGC::runOnFunction(Function &F, DominatorTree &DT,
 /// the live-out set of the basic block
 static void computeLiveInValues(BasicBlock::reverse_iterator Begin,
                                 BasicBlock::reverse_iterator End,
-                                SetVector<Value *> &LiveTmp) {
+                                SetVector<Value *> &LiveTmp,
+                                bool Compressed) {
   for (auto &I : make_range(Begin, End)) {
     // KILL/Def - Remove this definition from LiveIn
     LiveTmp.remove(&I);
@@ -2963,9 +3031,9 @@ static void computeLiveInValues(BasicBlock::reverse_iterator Begin,
 
     // USE - Add to the LiveIn set for this instruction
     for (Value *V : I.operands()) {
-      assert(!isUnhandledGCPointerType(V->getType()) &&
+      assert(!isUnhandledGCPointerType(V->getType(), Compressed) &&
              "support for FCA unimplemented");
-      if (isHandledGCPointerType(V->getType()) && !isa<Constant>(V)) {
+      if (isHandledGCPointerType(V->getType(), Compressed) && !isa<Constant>(V)) {
         // The choice to exclude all things constant here is slightly subtle.
         // There are two independent reasons:
         // - We assume that things which are constant (from LLVM's definition)
@@ -2983,6 +3051,7 @@ static void computeLiveInValues(BasicBlock::reverse_iterator Begin,
 }
 
 static void computeLiveOutSeed(BasicBlock *BB, SetVector<Value *> &LiveTmp) {
+  bool UseCompressedPointers = supportsCompressedPointers(*BB->getParent());
   for (BasicBlock *Succ : successors(BB)) {
     for (auto &I : *Succ) {
       PHINode *PN = dyn_cast<PHINode>(&I);
@@ -2990,9 +3059,9 @@ static void computeLiveOutSeed(BasicBlock *BB, SetVector<Value *> &LiveTmp) {
         break;
 
       Value *V = PN->getIncomingValueForBlock(BB);
-      assert(!isUnhandledGCPointerType(V->getType()) &&
+      assert(!isUnhandledGCPointerType(V->getType(), UseCompressedPointers) &&
              "support for FCA unimplemented");
-      if (isHandledGCPointerType(V->getType()) && !isa<Constant>(V))
+      if (isHandledGCPointerType(V->getType(), UseCompressedPointers) && !isa<Constant>(V))
         LiveTmp.insert(V);
     }
   }
@@ -3000,8 +3069,9 @@ static void computeLiveOutSeed(BasicBlock *BB, SetVector<Value *> &LiveTmp) {
 
 static SetVector<Value *> computeKillSet(BasicBlock *BB) {
   SetVector<Value *> KillSet;
+  bool UseCompressedPointers = supportsCompressedPointers(*BB);
   for (Instruction &I : *BB)
-    if (isHandledGCPointerType(I.getType()))
+    if (isHandledGCPointerType(I.getType(), UseCompressedPointers))
       KillSet.insert(&I);
   return KillSet;
 }
@@ -3038,12 +3108,13 @@ static void checkBasicSSA(DominatorTree &DT, GCPtrLivenessData &Data,
 static void computeLiveInValues(DominatorTree &DT, Function &F,
                                 GCPtrLivenessData &Data) {
   SmallSetVector<BasicBlock *, 32> Worklist;
+  bool UseCompressedPointers = supportsCompressedPointers(F);
 
   // Seed the liveness for each individual block
   for (BasicBlock &BB : F) {
     Data.KillSet[&BB] = computeKillSet(&BB);
     Data.LiveSet[&BB].clear();
-    computeLiveInValues(BB.rbegin(), BB.rend(), Data.LiveSet[&BB]);
+    computeLiveInValues(BB.rbegin(), BB.rend(), Data.LiveSet[&BB], UseCompressedPointers);
 
 #ifndef NDEBUG
     for (Value *Kill : Data.KillSet[&BB])
@@ -3115,7 +3186,7 @@ static void findLiveSetAtInst(Instruction *Inst, GCPtrLivenessData &Data,
   // (unless they're used again later).  This adjustment is
   // specifically what we need to relocate
   computeLiveInValues(BB->rbegin(), ++Inst->getIterator().getReverse(),
-                      LiveOut);
+                      LiveOut, supportsCompressedPointers(*BB));
   LiveOut.remove(Inst);
   Out.insert(LiveOut.begin(), LiveOut.end());
 }

@@ -718,6 +718,15 @@ CallInst *IRBuilderBase::CreateGCStatepointCall(
 }
 
 CallInst *IRBuilderBase::CreateGCStatepointCall(
+    uint64_t ID, uint32_t NumPatchBytes, Value *ActualCallee, uint32_t Flags,
+    ArrayRef<Value *> CallArgs, Optional<ArrayRef<Use>> TransitionArgs,
+    Optional<ArrayRef<Value *>> DeoptArgs, ArrayRef<Value *> GCArgs, const Twine &Name) {
+  return CreateGCStatepointCallCommon<Value *, Use, Value *, Value *>(
+      this, ID, NumPatchBytes, ActualCallee, Flags, CallArgs, TransitionArgs,
+      DeoptArgs, GCArgs, Name);
+}
+
+CallInst *IRBuilderBase::CreateGCStatepointCall(
     uint64_t ID, uint32_t NumPatchBytes, Value *ActualCallee,
     ArrayRef<Use> CallArgs, Optional<ArrayRef<Value *>> DeoptArgs,
     ArrayRef<Value *> GCArgs, const Twine &Name) {
@@ -770,6 +779,16 @@ InvokeInst *IRBuilderBase::CreateGCStatepointInvoke(
     ArrayRef<Value *> InvokeArgs, Optional<ArrayRef<Use>> TransitionArgs,
     Optional<ArrayRef<Use>> DeoptArgs, ArrayRef<Value *> GCArgs, const Twine &Name) {
   return CreateGCStatepointInvokeCommon<Value *, Use, Use, Value *>(
+      this, ID, NumPatchBytes, ActualInvokee, NormalDest, UnwindDest, Flags,
+      InvokeArgs, TransitionArgs, DeoptArgs, GCArgs, Name);
+}
+
+InvokeInst *IRBuilderBase::CreateGCStatepointInvoke(
+    uint64_t ID, uint32_t NumPatchBytes, Value *ActualInvokee,
+    BasicBlock *NormalDest, BasicBlock *UnwindDest, uint32_t Flags,
+    ArrayRef<Value *> InvokeArgs, Optional<ArrayRef<Use>> TransitionArgs,
+    Optional<ArrayRef<Value *>> DeoptArgs, ArrayRef<Value *> GCArgs, const Twine &Name) {
+  return CreateGCStatepointInvokeCommon<Value *, Use, Value *, Value *>(
       this, ID, NumPatchBytes, ActualInvokee, NormalDest, UnwindDest, Flags,
       InvokeArgs, TransitionArgs, DeoptArgs, GCArgs, Name);
 }
