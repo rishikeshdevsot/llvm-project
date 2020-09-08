@@ -35,6 +35,11 @@ using namespace llvm;
 #define GET_REGINFO_TARGET_DESC
 #include "AArch64GenRegisterInfo.inc"
 
+static cl::opt<bool>
+    FrameRecordOnTop("aarch64-frame-record-on-top",
+                     cl::desc("place the frame record on top of the frame"),
+                     cl::init(false), cl::Hidden);
+
 AArch64RegisterInfo::AArch64RegisterInfo(const Triple &TT)
     : AArch64GenRegisterInfo(AArch64::LR), TT(TT) {
   AArch64_MC::initLLVMToCVRegMapping(this);
@@ -110,6 +115,8 @@ AArch64RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
     return CSR_AArch64_AAPCS_X18_SaveList;
   if (hasSVEArgsOrReturn(MF))
     return CSR_AArch64_SVE_AAPCS_SaveList;
+  if (FrameRecordOnTop)
+    return CSR_Darwin_AArch64_AAPCS_SaveList;
   return CSR_AArch64_AAPCS_SaveList;
 }
 
