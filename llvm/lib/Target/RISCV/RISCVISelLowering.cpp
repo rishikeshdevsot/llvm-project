@@ -8728,6 +8728,19 @@ RISCVTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
     return emitQuietFCMP(MI, BB, RISCV::FLE_D, RISCV::FEQ_D, Subtarget);
   case RISCV::PseudoQuietFLT_D:
     return emitQuietFCMP(MI, BB, RISCV::FLT_D, RISCV::FEQ_D, Subtarget);
+  case TargetOpcode::STATEPOINT:
+    // STATEPOINT is a pseudo instruction which has no implicit defs/uses
+    // while jal call instruction (where statepoint will be lowered at the end)
+    // has implicit def. Add this implicit dead def here as a workaround.
+    MI.addOperand(*MI.getMF(), MachineOperand::CreateReg(RISCV::X1, true, true,
+                                                         false, true));
+    LLVM_FALLTHROUGH;
+  case TargetOpcode::STACKMAP:
+  case TargetOpcode::PATCHPOINT:
+    if (!Subtarget.is64Bit())
+      report_fatal_error("STACKMAP, PATCHPOINT and STATEPOINT are only "
+                         "supported on 64-bit targets");
+    return emitPatchPoint(MI, BB);
   }
 }
 

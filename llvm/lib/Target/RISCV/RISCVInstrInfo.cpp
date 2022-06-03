@@ -25,6 +25,7 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/CodeGen/StackMaps.h"
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -987,7 +988,25 @@ unsigned RISCVInstrInfo::getInstSizeInBytes(const MachineInstr &MI) const {
     if (isCompressibleInst(MI, &ST, MRI, STI))
       return 2;
   }
-  return get(Opcode).getSize();
+
+  switch (Opcode) {
+  case TargetOpcode::STACKMAP:
+    // The upper bound for a stackmap intrinsic is the full length of its shadow
+    return StackMapOpers(&MI).getNumPatchBytes();
+  case TargetOpcode::PATCHPOINT:
+    // The size of the patchpoint intrinsic is the number of bytes requested
+    return PatchPointOpers(&MI).getNumPatchBytes();
+  case TargetOpcode::STATEPOINT: {
+    // The size of the statepoint intrinsic is the number of bytes requested
+    unsigned NumBytes = StatepointOpers(&MI).getNumPatchBytes();
+    // A statepoint is at least a PSEUDOCALL
+    if (NumBytes < 8)
+      NumBytes = 8;
+    return NumBytes;
+  }
+  default:
+    return get(Opcode).getSize();
+  }
 }
 
 bool RISCVInstrInfo::isAsCheapAsAMove(const MachineInstr &MI) const {
